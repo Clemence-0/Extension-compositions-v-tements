@@ -3,6 +3,12 @@
   let S = { ...CC.DEFAULTS, ...(await chrome.storage.sync.get(null)) };
   if (!S.sites.includes(host)) return; // inactif tant que le site n'est pas activé dans le popup
 
+  // Les compositions analysées avec une ancienne version sont jetées
+  if ((await chrome.storage.local.get('cacheVersion')).cacheVersion !== CC.VERSION) {
+    await chrome.storage.local.clear();
+    await chrome.storage.local.set({ cacheVersion: CC.VERSION });
+  }
+
   const CACHE_TTL = 7 * 864e5, MISS_TTL = 864e5, CONCURRENCY = 3;
   const PRICE_RE = /\d\s?(€|eur\b|\$|£|chf)|(€|\$|£)\s?\d/i;
 

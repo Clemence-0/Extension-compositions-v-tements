@@ -47,6 +47,15 @@
   const KEYWORD_RE = /composition|matiere|materiau|material|fabric|tissu|zusammensetzung|composicion|composizione/g;
   const GAP_MAX = 25;
 
+  // Libellés de section : ce qui n'est PAS le tissu principal…
+  const LINING_RE = /\b(doublures?|lining|forro|fodera|futter|voering|poches?|pocket(?:ing)?s?|bolsillos?|rembourrage|garnissage|ouatinage|ouatine|filling|padding|relleno|imbottitura|bords?[ -]?cotes?|ribbing|garnitures?|trims?|empiecements?)\b/g;
+  // … et ce qui l'est explicitement
+  const MAIN_RE = /\b(exterieur|tissu (?:principal|exterieur)|matiere (?:principale|exterieure)|dessus|outer(?: shell)?|shell|main (?:fabric|material)|exterior|tejido (?:principal|exterior)|tessuto (?:principale|esterno)|esterno|oberstoff|aussenmaterial|hauptmaterial)\b/g;
+  const GENERIC_RE = /\b(composition|material|matiere|tissu|fabric|composicion|composizione|zusammensetzung)\b/;
+  const LABEL_ANY = new RegExp(`${LINING_RE.source}|${MAIN_RE.source}|${GENERIC_RE.source}`);
+  // Entre un % et sa fibre : pas d'autre chiffre, de fin de phrase ni de libellé de section
+  const badGap = s => /[\d%!?;]/.test(s) || LABEL_ANY.test(s);
+
   // Associe chaque pourcentage à une fibre, soit après ("60% coton"), soit avant ("Coton 60%")
   function pairs(text, dir) {
     const fibers = [...text.matchAll(FIBER_RE)].map(m => ({ i: m.index, end: m.index + m[0].length, key: WORD2KEY[m[1]] }));
@@ -62,33 +71,55 @@
       let f = null;
       if (dir === 'after') {
         for (let j = fi; j < fibers.length && fibers[j].i - pEnd <= GAP_MAX; j++) {
-          if (fibers[j].i >= pEnd) { if (!/[\d%]/.test(text.slice(pEnd, fibers[j].i))) f = fibers[j]; break; }
+          if (fibers[j].i >= pEnd) { if (!badGap(text.slice(pEnd, fibers[j].i))) f = fibers[j]; break; }
         }
       } else {
         for (let j = fi; j < fibers.length && fibers[j].end <= m.index; j++) f = fibers[j];
-        if (f && /[\d%]/.test(text.slice(f.end, m.index))) f = null;
+        if (f && badGap(text.slice(f.end, m.index))) f = null;
       }
-      if (f) out.push({ pos: m.index, key: f.key, v });
+      if (f) out.push({ start: Math.min(m.index, f.i), end: Math.max(pEnd, f.end), key: f.key, v });
     }
     return out;
   }
 
-  // Premier bloc de fibres consécutives qui totalise 100 % (= tissu principal)
-  function firstGroup(ps) {
+  // Tous les blocs de fibres consécutives qui totalisent 100 %
+  function groups(ps) {
+    const out = [];
     let g = {}, sum = 0, last = -1e9, start = 0;
     for (const p of ps) {
-      if (p.pos - last > 200 || g[p.key] != null || sum + p.v > 101) { g = {}; sum = 0; }
-      if (sum === 0) start = p.pos;
-      g[p.key] = p.v; sum += p.v; last = p.pos;
-      if (Math.abs(sum - 100) <= 1) return { fibers: g, pos: start };
+      if (p.start - last > 200 || g[p.key] != null || sum + p.v > 101) { g = {}; sum = 0; }
+      if (sum === 0) start = p.start;
+      g[p.key] = p.v; sum += p.v; last = p.end;
+      if (Math.abs(sum - 100) <= 1) { out.push({ fibers: g, start, end: p.end }); g = {}; sum = 0; }
     }
-    return null;
+    return out;
   }
 
-  function best(t) {
-    const a = firstGroup(pairs(t, 'after')), b = firstGroup(pairs(t, 'before'));
-    if (a && b) return b.pos < a.pos ? b : a;
-    return a || b;
+  // Quel libellé précède le bloc ? Le plus proche l'emporte ; "composition" seul = tissu principal
+  function labelOf(text, from, to) {
+    const zone = text.slice(Math.max(from, to - 80), to);
+    let found = null;
+    for (const [re, kind] of [[LINING_RE, 'lining'], [MAIN_RE, 'main']])
+      for (const m of zone.matchAll(re)) if (!found || m.index >= found.i) found = { i: m.index, kind };
+    if (found) return found.kind;
+    return GENERIC_RE.test(zone) ? 'main' : 'none';
+  }
+
+  const RANK = { main: 2, none: 1 };
+
+  // Choisit le tissu principal : bloc étiqueté principal > bloc sans étiquette ; doublure & co. ignorés
+  function pick(t) {
+    const ga = groups(pairs(t, 'after')), gb = groups(pairs(t, 'before'));
+    const gs = !ga.length ? gb : !gb.length ? ga : (gb[0].start < ga[0].start ? gb : ga);
+    let best = null, prevEnd = 0;
+    for (const g of gs) {
+      const kind = labelOf(t, prevEnd, g.start);
+      prevEnd = g.end;
+      if (kind === 'lining') continue;
+      if (!best || RANK[kind] > best.rank) best = { fibers: g.fibers, rank: RANK[kind] };
+      if (best.rank === 2) break;
+    }
+    return best;
   }
 
   // sure = trouvé près d'un mot-clé "composition / matière…"
@@ -96,11 +127,11 @@
     const text = norm(raw);
     let n = 0;
     for (const m of text.matchAll(KEYWORD_RE)) {
-      const r = best(text.slice(m.index, m.index + 800));
+      const r = pick(text.slice(Math.max(0, m.index - 80), m.index + 800)); // -80 : voir "Doublure" placé avant "composition"
       if (r) return { fibers: r.fibers, sure: true };
       if (++n > 40) break;
     }
-    const r = best(text);
+    const r = pick(text);
     return r ? { fibers: r.fibers, sure: false } : null;
   }
 
@@ -126,5 +157,7 @@
       .map(([k, v]) => `${Math.round(v * 10) / 10}% ${FIBERS[k].label}`).join(', ');
   }
 
-  global.CC = { FIBERS, DEFAULTS, parseText, htmlToText, verdict, describe };
+  const VERSION = 2; // à incrémenter quand l'analyse change : vide le cache des compositions
+
+  global.CC = { VERSION, FIBERS, DEFAULTS, parseText, htmlToText, verdict, describe };
 })(globalThis);
