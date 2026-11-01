@@ -24,29 +24,33 @@
   };
 
   // ---------- Récupération des fiches produit ----------
-  async function fetchComp(key, href) {
+  async function fetchComp(key, href, text) {
     const cached = (await chrome.storage.local.get(key))[key];
-    if (cached && Date.now() - cached.t < (cached.c ? CACHE_TTL : MISS_TTL)) return cached.c;
+    const found = cached?.c && (cached.c.fibers || cached.c.type === 'hors');
+    if (cached && Date.now() - cached.t < (found ? CACHE_TTL : MISS_TTL)) return cached.c;
+    // "Mocassin homme…", ".../parfums/..." : type non analysé, inutile d'ouvrir la fiche
+    const type = CC.cardType(text, href);
+    if (type === 'hors' || !S.types.includes(type)) return { type, skipped: true };
     try {
       const r = await fetch(href, { credentials: 'include' });
       if (!r.ok) return null;
-      const c = CC.parseText(CC.htmlToText(await r.text()));
+      const c = CC.analyze(CC.parseHtml(await r.text()), href);
       await chrome.storage.local.set({ [key]: { c, t: Date.now() } });
       return c;
     } catch { return null; }
   }
 
-  function getComp(key, href) {
-    if (!results.has(key)) results.set(key, new Promise(res => queue.push({ key, href, res })));
+  function getComp(key, href, text) {
+    if (!results.has(key)) results.set(key, new Promise(res => queue.push({ key, href, text, res })));
     pump();
     return results.get(key);
   }
 
   function pump() {
     while (active < CONCURRENCY && queue.length) {
-      const { key, href, res } = queue.shift();
+      const { key, href, text, res } = queue.shift();
       active++; updatePill();
-      fetchComp(key, href).then(res, () => res(null)).finally(() => { active--; pump(); updatePill(); });
+      fetchComp(key, href, text).then(res, () => res(null)).finally(() => { active--; pump(); updatePill(); });
     }
   }
 
@@ -58,7 +62,7 @@
   async function processCard(card) {
     const info = cards.get(card);
     if (!info) return;
-    info.comp = await getComp(info.key, info.href);
+    info.comp = await getComp(info.key, info.href, card.textContent);
     info.done = true;
     apply(card);
   }
@@ -103,12 +107,14 @@
     const info = cards.get(card);
     if (!info || !info.done) return;
     const v = CC.verdict(info.comp, S);
+    info.status = v.status;
     const flagged = v.status === 'bad' || (v.status === 'unknown' && S.hideUnknown);
     card.classList.toggle('cc-hidden', flagged && S.mode === 'hide' && !revealed);
     card.classList.toggle('cc-dimmed', flagged && (S.mode === 'dim' || revealed));
 
+    // Article non concerné : pas de pastille, l'extension se tait
     let b = card.querySelector(':scope > .cc-badge');
-    if (S.badges) {
+    if (S.badges && v.status !== 'na') {
       if (!b) {
         b = document.createElement('div');
         b.className = 'cc-badge cc-ui';
@@ -116,7 +122,7 @@
         card.appendChild(b);
       }
       b.dataset.status = v.status;
-      b.textContent = v.status === 'unknown' ? '? inconnue' : CC.describe(info.comp.fibers);
+      b.textContent = v.status === 'unknown' ? '? introuvable' : CC.describe(info.comp.fibers);
     } else if (b) b.remove();
     updatePill();
   }
@@ -134,7 +140,7 @@
     let done = 0, flagged = 0;
     for (const [c, i] of cards) {
       if (!c.isConnected) { cards.delete(c); continue; }
-      if (!i.done) continue;
+      if (!i.done || i.status === 'na') continue; // les non concernés ne comptent pas
       done++;
       if (c.classList.contains('cc-hidden') || c.classList.contains('cc-dimmed')) flagged++;
     }
@@ -148,17 +154,25 @@
   let lastUrl = '';
   function checkProductPage(attempt = 0) {
     document.querySelector('.cc-banner')?.remove();
-    const comp = CC.parseText(CC.htmlToText(document.documentElement.outerHTML));
-    if (!comp || !comp.sure) {
-      if (attempt < 2) setTimeout(() => location.href === lastUrl && checkProductPage(attempt + 1), 2500);
-      return;
-    }
+    const doc = CC.parseHtml(document.documentElement.outerHTML), page = CC.productInfo(doc);
+    const comp = CC.judge(doc.documentElement.textContent, page, location.href);
     const v = CC.verdict(comp, S);
+    if (v.status === 'na') return;
+    if (!comp.sure) { // introuvable, ou trouvé loin de tout mot-clé "composition" : la page finit peut-être de charger
+      if (attempt < 2) return setTimeout(() => location.href === lastUrl && checkProductPage(attempt + 1), 2500);
+      if (!page.isProduct) return; // pages liste : rien à dire
+    }
+    if (v.status === 'unknown') return banner('unknown', '? Composition introuvable sur cette fiche');
+    banner(v.status, `${v.status === 'bad' ? '✗' : '✓'} ${CC.describe(comp.fibers)} — ${v.bad}% de fibres exclues (seuil ${S.threshold}%)`
+      + (comp.sure ? '' : ' · à vérifier'));
+  }
+
+  function banner(status, text) {
     const el = document.createElement('div');
     el.className = 'cc-banner cc-ui';
-    el.dataset.status = v.status;
+    el.dataset.status = status;
     el.innerHTML = `<span></span><button aria-label="Fermer">×</button>`;
-    el.firstChild.textContent = `${v.status === 'bad' ? '✗' : '✓'} ${CC.describe(comp.fibers)} — ${v.bad}% de fibres exclues (seuil ${S.threshold}%)`;
+    el.firstChild.textContent = text;
     el.lastChild.onclick = () => el.remove();
     document.documentElement.appendChild(el);
   }
@@ -180,6 +194,12 @@
   chrome.storage.onChanged.addListener((ch, area) => {
     if (area !== 'sync') return;
     for (const k in ch) S[k] = ch[k].newValue ?? CC.DEFAULTS[k];
+    if (ch.types) cards.forEach((info, c) => { // fiches jamais ouvertes car type non coché : on les ouvre maintenant
+      if (!info.comp?.skipped) return;
+      results.delete(info.key);
+      info.done = false;
+      processCard(c);
+    });
     cards.forEach((_, c) => apply(c));
     lastUrl = ''; onUrl();
   });

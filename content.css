@@ -31,6 +31,7 @@
   font: 600 13px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
   box-shadow: 0 4px 16px rgba(0,0,0,.25);
 }
+.cc-banner[data-status="unknown"] { background: #6b6b6b; }
 .cc-banner[data-status="ok"]  { background: #1f7a4d; }
 .cc-banner[data-status="bad"] { background: #b3261e; }
 .cc-banner button { text-decoration: none; font-size: 18px; line-height: 1; }

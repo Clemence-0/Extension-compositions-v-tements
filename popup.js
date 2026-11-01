@@ -22,6 +22,16 @@
   $('threshold').oninput = e => $('thVal').textContent = e.target.value + ' %';
   $('threshold').onchange = e => save({ threshold: +e.target.value });
 
+  for (const [k, t] of Object.entries(CC.TYPES)) {
+    if (!t.label) continue; // 'hors' : jamais analysé
+    const l = document.createElement('label');
+    l.innerHTML = `<input type="checkbox" value="${k}"> <span></span>`;
+    l.lastChild.textContent = t.label;
+    l.firstChild.checked = S.types.includes(k);
+    l.firstChild.onchange = () => save({ types: [...document.querySelectorAll('#types input:checked')].map(i => i.value) });
+    $('types').appendChild(l);
+  }
+
   for (const [k, f] of Object.entries(CC.FIBERS)) {
     if (f.cat === 'nat') continue;
     const l = document.createElement('label');
